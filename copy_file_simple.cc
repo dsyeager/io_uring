@@ -11,8 +11,6 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include <atomic>
-#include <charconv>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -25,6 +23,126 @@ using namespace std::literals;
 
 static uint64_t s_completed_requests = 0;
 
+template <class EVENT_CLASS>
+class io_uring_wrapper
+{
+private:
+    io_uring m_ring;
+    uint32_t m_queue_depth;
+    uint32_t m_pending = 0;
+    bool m_valid = true;
+public:
+    io_uring_wrapper(uint32_t queue_depth)
+        : m_queue_depth(queue_depth)
+    {
+        // 1. Initialize the io_uring instance with a queue depth of 1
+        int ret = io_uring_queue_init(queue_depth, &m_ring, 0);
+        if (ret < 0)
+        {
+            ERROR << "io_uring_queue_init: " << ::strerror(-ret) << std::endl;
+            m_valid = false;
+            return;
+        }
+    }
+
+    ~io_uring_wrapper()
+    {
+        if (m_valid)
+        {
+            io_uring_queue_exit(&m_ring);
+        }
+    }
+
+    void submit()
+    {
+        if (!m_valid)
+            return;
+        io_uring_submit(&m_ring);
+    }
+
+    bool prep_write(int fd, char *buffer, size_t len, off_t offset, void *data)
+    {
+        if (!m_valid)
+            return false;
+
+        io_uring_sqe *sqe = io_uring_get_sqe(&m_ring);
+        if (!sqe)
+        {
+            ERROR << "io_uring_get_sqe: failed to get SQE" << std::endl;
+            io_uring_queue_exit(&m_ring);
+            m_valid = false;
+            return false;
+        }
+
+        io_uring_sqe_set_data(sqe, data);
+
+        io_uring_prep_write(sqe, fd, buffer, len, offset);
+
+        m_pending++;
+
+        return true;
+    }
+
+    bool prep_read(int fd, char *buffer, size_t sz, off_t offset, void *data)
+    {
+        if (!m_valid)
+            return false;
+        io_uring_sqe *sqe = io_uring_get_sqe(&m_ring);
+        if (!sqe)
+        {
+            ERROR << "io_uring_get_sqe: failed to get SQE" << std::endl;
+            io_uring_queue_exit(&m_ring);
+            m_valid = false;
+            return false;
+        }
+
+        io_uring_sqe_set_data(sqe, data);
+
+        io_uring_prep_read(sqe, fd, buffer, sz, offset);
+
+        m_pending++;
+
+        return true;
+    }
+
+    uint32_t process_events(uint32_t max_events = UINT32_MAX, __kernel_timespec *ts = nullptr)
+    {
+        if (!m_valid)
+            return 0;
+
+        io_uring_cqe *cqe = nullptr;
+        unsigned i = 0;
+
+        // last two nullptr's are timespec and sigmask
+        if (0 == io_uring_wait_cqes(&m_ring, &cqe, std::min(max_events, m_pending), ts, nullptr))
+        {
+            unsigned head;
+            uint32_t new_events = 0;
+
+            io_uring_for_each_cqe(&m_ring, head, cqe)
+            {
+                 m_pending--; // decrement prior to ::process potentially incrementing
+                 EVENT_CLASS *req = reinterpret_cast<EVENT_CLASS*>(io_uring_cqe_get_data(cqe));
+                 new_events += req->process(cqe->res);
+                 i++;
+            }
+
+            DEBUG(1) << "batch events: " << i << ENDL;
+
+            if (new_events)
+                io_uring_submit(&m_ring);
+
+            io_uring_cq_advance(&m_ring, i);
+        }
+        return i;
+    }
+
+    bool is_valid() const { return m_valid; }
+
+    uint32_t pending() const { return m_pending; }
+
+};
+
 class client_request
 {
 private:
@@ -36,11 +154,11 @@ private:
     int  m_input_fd = -1;
     int  m_output_fd = -1;
     uint32_t m_index = 0;
-    io_uring *m_ring = nullptr;
+    io_uring_wrapper<client_request> *m_file_uring = nullptr;
 
 public:
-    client_request(int input_fd, std::string_view output_path, uint32_t index, io_uring *ring)
-    : m_input_fd(dup(input_fd)), m_index(index), m_ring(ring)
+    client_request(int input_fd, std::string_view output_path, uint32_t index, io_uring_wrapper<client_request> *file_uring)
+        : m_input_fd(dup(input_fd)), m_index(index), m_file_uring(file_uring)
     {
         // build the full output filepath with index on the end
         // open the output fd
@@ -57,51 +175,29 @@ public:
 
     bool start_io_uring()
     {
-        if (!m_ring)
-        {
-            ERROR << "m_ring is NULL" << std::endl;
-            return false;
-        }
-
-        io_uring_sqe *sqe = io_uring_get_sqe(m_ring);
-        if (!sqe)
-        {
-            ERROR << "io_uring_get_sqe: failed to get SQE" << std::endl;
-            io_uring_queue_exit(m_ring);
-            return false;
-        }
-
-        io_uring_prep_read(sqe, m_input_fd, m_buffer, BUFFER_SZ, 0);
-        io_uring_sqe_set_data(sqe, (void*) this);
-
-        return true;
+        m_state = READING_CLIENT_INPUT;
+        return m_file_uring && m_file_uring->prep_read(m_input_fd, m_buffer, BUFFER_SZ, m_offset, this);
     }
 
     uint32_t process(int res)
     {
+        if (!m_file_uring)
+            return 0;
+
         if (res > 0)
         {
-            io_uring_sqe *sqe = io_uring_get_sqe(m_ring);
-            if (!sqe)
-            {
-                ERROR << "io_uring_get_sqe: failed to get SQE" << std::endl;
-                io_uring_queue_exit(m_ring);
-                return 0;
-            }
-            io_uring_sqe_set_data(sqe, (void*) this);
-
             switch (m_state) {
             case READING_CLIENT_INPUT:
                 // Read successful. Write to stdout.
                 DEBUG(1) << "writing " << res << " bytes to m_output_fd: " << m_output_fd << ENDL;
-                io_uring_prep_write(sqe, m_output_fd, m_buffer, res, -1);
+                m_file_uring->prep_write(m_output_fd, m_buffer, res, -1, this);
                 m_state = WRITING_TO_FILE;
                 m_offset += res;
                 break;
             case WRITING_TO_FILE:
                 m_bytes_written += res;
                 DEBUG(1) << "reading up to " << BUFFER_SZ << " bytes from m_input_fd: " << m_input_fd << ENDL;
-                io_uring_prep_read(sqe, m_input_fd, m_buffer, BUFFER_SZ, m_offset);
+                m_file_uring->prep_read(m_input_fd, m_buffer, BUFFER_SZ, m_offset, this);
                 m_state = READING_CLIENT_INPUT;
                 break;
             };
@@ -118,7 +214,7 @@ public:
         else if (res < 0)
         {
             // Error reading file
-            ERROR << strerror(abs(res)) << endl;
+            ERROR << ::strerror(abs(res)) << endl;
             m_state = FAILED;
             s_completed_requests++;
             return 0;
@@ -135,6 +231,7 @@ int32_t main (int argc, char **argv)
     std::string input;
     std::string output;
     uint32_t cnt = 1;
+    uint32_t event_cnt = 1000;
 
     for (int i = 1; i < argc; i++)
     {
@@ -151,6 +248,10 @@ int32_t main (int argc, char **argv)
         {
             cnt = aton(val);
         } 
+        else if (key == "--event-cnt"sv)
+        {
+            event_cnt = aton(val);
+        } 
         else if (key == "--debug"sv)
         {
             s_debug_level = aton(val);
@@ -160,17 +261,13 @@ int32_t main (int argc, char **argv)
     int input_fd = ::open(input.data(), O_RDONLY);
     if (input_fd < 0)
     {
-        ERROR << "Failed to open " << input << ", " << strerror(errno) << endl;
+        ERROR << "Failed to open " << input << ", " << ::strerror(errno) << endl;
         return 0;
     }
 
-    struct io_uring ring;
-
-    // 1. Initialize the io_uring instance with a queue depth of 1
-    int ret = io_uring_queue_init(cnt + 10, &ring, 0);
-    if (ret < 0)
+    io_uring_wrapper<client_request> file_uring(cnt);
+    if (!file_uring.is_valid())
     {
-        ERROR << "io_uring_queue_init: " << ::strerror(-ret) << std::endl;
         return 1;
     }
 
@@ -180,43 +277,18 @@ int32_t main (int argc, char **argv)
 
     for (uint32_t i = 0; i < cnt; i++)
     {
-        requests.push_back(new client_request(input_fd, output, i, &ring));
+        requests.push_back(new client_request(input_fd, output, i, &file_uring));
         requests.back()->start_io_uring();
     }
-    io_uring_submit(&ring);
-
-
-    io_uring_cqe *cqe = nullptr;
+    file_uring.submit();
 
     uint32_t batch_cnt = 0;
 
-    while (s_completed_requests < requests.size())
+    while (file_uring.pending())
     {
         // last two nullptr's are timespec and sigmask
-        if (0 == io_uring_wait_cqes(&ring, &cqe, std::min(1000UL, requests.size() - s_completed_requests), nullptr, nullptr))
-        {
-            unsigned head;
-            unsigned i = 0;
-            uint32_t new_events = 0;
-
-            io_uring_for_each_cqe(&ring, head, cqe)
-            {
-                 client_request *req = (client_request*) io_uring_cqe_get_data(cqe);
-                 new_events += req->process(cqe->res);
-                 i++;
-            }
-
-            DEBUG(1) << "batch events: " << i << ENDL;
-            batch_cnt++;
-
-            if (new_events)
-                io_uring_submit(&ring);
-
-            io_uring_cq_advance(&ring, i);
-
-        }
+        file_uring.process_events(event_cnt);
+        batch_cnt++;
     }
     TRACE << "batch cnt: " << batch_cnt << std::endl;
-
-    io_uring_queue_exit(&ring);
 }

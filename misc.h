@@ -18,9 +18,10 @@ std::pair<std::string_view, std::string_view> split(const std::string_view &src,
     return std::pair(left, right);
 }
 
-bool aton(auto str, uint32_t &number, bool short_ok = false)
+template<typename NUMBER> 
+bool aton(auto str, NUMBER &number, bool short_ok = false)
 {
-    uint32_t value = 0;
+    NUMBER value = 0;
     const char* begin = str.data();
     const char* end = begin + str.size();
     auto const out = std::from_chars(begin, end, value, 10);
@@ -32,7 +33,7 @@ bool aton(auto str, uint32_t &number, bool short_ok = false)
         std::cerr << "err: " << ec.message() << std::endl;
         return false;
     }
-    number = out;
+    number = value;
     return true;
 }
 
