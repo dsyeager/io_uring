@@ -1,5 +1,12 @@
+#include "commas.h"
+#include "get_nanoseconds.h"
+#include "hash.h"
+#include "io_uring_wrapper.h"
 #include "log.h"
 #include "misc.h"
+#include "scoped_lock.h"
+#include "string_view.h"
+#include "time_tracker.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -11,166 +18,82 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
-using std::cout, std::cerr, std::endl, std::string, std::string_view, std::vector;
+using std::string, std::string_view, std::vector;
 using namespace std::literals;
 
-#define BUFFER_SZ 1024
+#define BUFFER_SZ 64 * 1024
 
-static uint64_t s_completed_requests = 0;
 
-template <class EVENT_CLASS>
-class io_uring_wrapper
+time_tracker s_times(10000);
+
+/**
+ A fixed length meta data written before each file
+ Between the fixed length data and the file data we write variable 
+ length vals like file name and description
+  */
+struct file_meta_data
 {
-private:
-    io_uring m_ring;
-    uint32_t m_queue_depth;
-    uint32_t m_pending = 0;
-    bool m_valid = true;
 public:
-    io_uring_wrapper(uint32_t queue_depth)
-        : m_queue_depth(queue_depth)
-    {
-        // 1. Initialize the io_uring instance with a queue depth of 1
-        int ret = io_uring_queue_init(queue_depth, &m_ring, 0);
-        if (ret < 0)
-        {
-            ERROR << "io_uring_queue_init: " << ::strerror(-ret) << std::endl;
-            m_valid = false;
-            return;
-        }
-    }
-
-    ~io_uring_wrapper()
-    {
-        if (m_valid)
-        {
-            io_uring_queue_exit(&m_ring);
-        }
-    }
-
-    void submit()
-    {
-        if (!m_valid)
-            return;
-        io_uring_submit(&m_ring);
-    }
-
-    bool prep_write(int fd, char *buffer, size_t len, off_t offset, void *data)
-    {
-        if (!m_valid)
-            return false;
-
-        io_uring_sqe *sqe = io_uring_get_sqe(&m_ring);
-        if (!sqe)
-        {
-            ERROR << "io_uring_get_sqe: failed to get SQE" << std::endl;
-            io_uring_queue_exit(&m_ring);
-            m_valid = false;
-            return false;
-        }
-
-        io_uring_sqe_set_data(sqe, data);
-
-        io_uring_prep_write(sqe, fd, buffer, len, offset);
-
-        m_pending++;
-
-        return true;
-    }
-
-    bool prep_read(int fd, char *buffer, size_t sz, off_t offset, void *data)
-    {
-        if (!m_valid)
-            return false;
-        io_uring_sqe *sqe = io_uring_get_sqe(&m_ring);
-        if (!sqe)
-        {
-            ERROR << "io_uring_get_sqe: failed to get SQE" << std::endl;
-            io_uring_queue_exit(&m_ring);
-            m_valid = false;
-            return false;
-        }
-
-        io_uring_sqe_set_data(sqe, data);
-
-        io_uring_prep_read(sqe, fd, buffer, sz, offset);
-
-        m_pending++;
-
-        return true;
-    }
-
-    uint32_t process_events(uint32_t max_events = UINT32_MAX, __kernel_timespec *ts = nullptr)
-    {
-        if (!m_valid)
-            return 0;
-
-        io_uring_cqe *cqe = nullptr;
-        unsigned i = 0;
-
-        // last two nullptr's are timespec and sigmask
-        if (0 == io_uring_wait_cqes(&m_ring, &cqe, std::min(max_events, m_pending), ts, nullptr))
-        {
-            unsigned head;
-            uint32_t new_events = 0;
-
-            io_uring_for_each_cqe(&m_ring, head, cqe)
-            {
-                 m_pending--; // decrement prior to ::process potentially incrementing
-                 EVENT_CLASS *req = reinterpret_cast<EVENT_CLASS*>(io_uring_cqe_get_data(cqe));
-                 new_events += req->process(cqe->res);
-                 i++;
-            }
-
-            DEBUG(1) << "batch events: " << i << ENDL;
-
-            if (new_events)
-                io_uring_submit(&m_ring);
-
-            io_uring_cq_advance(&m_ring, i);
-        }
-        return i;
-    }
-
-    bool is_valid() const { return m_valid; }
-
-    uint32_t pending() const { return m_pending; }
-
+    uint64_t file_size = 0;
+    uint64_t file_hash = 0;
+    time_t   write_time = 0;
+    uint16_t file_name_len = 0;
+    uint16_t file_desc_len = 0;
+    // some room built into the fixed length buffer for future uses like tags
+    uint16_t future_1_len = 0;
+    uint16_t future_2_len = 0;
+    uint16_t future_3_len = 0;
+    uint16_t future_4_len = 0;
 };
 
 class client_request
 {
 private:
-    enum STATE {READING_CLIENT_INPUT, WRITING_TO_FILE, COMPLETED, FAILED};
+    enum STATE {READING_CLIENT_INPUT, WRITING_TO_FILE, WRITING_META, COMPLETED, FAILED};
     STATE m_state = READING_CLIENT_INPUT;
     char m_buffer[BUFFER_SZ];
     off_t m_offset = 0;
+    off_t m_output_offset = 0;
     uint64_t m_bytes_written = 0;
     int  m_input_fd = -1;
     int  m_output_fd = -1;
     uint32_t m_index = 0;
     io_uring_wrapper<client_request> *m_file_uring = nullptr;
+    uint64_t m_start_ns = 0;
+    uint64_t m_end_ns = 0;
+
+    file_meta_data m_meta;
+    std::string m_file_name;
+    std::string m_file_desc;
+    uint64_t m_meta_bytes_to_write = 0;
+
+    uint64_t meta_size() const { return sizeof(file_meta_data) + m_file_name.size() + m_file_desc.size(); } 
+    uint64_t file_start() const { return m_output_offset + meta_size(); }
 
 public:
-    client_request(int input_fd, std::string_view output_path, uint32_t index, io_uring_wrapper<client_request> *file_uring)
-        : m_input_fd(dup(input_fd)), m_index(index), m_file_uring(file_uring)
+    client_request(std::string_view file_name,
+                   std::string_view file_desc,
+                   int input_fd,
+                   uint32_t index,
+                   io_uring_wrapper<client_request> *file_uring,
+                   int output_fd = -1,
+                   off_t output_offset = 0)
+        : m_input_fd(dup(input_fd)),
+          m_index(index),
+          m_file_uring(file_uring),
+          m_output_fd(output_fd),
+          m_output_offset(output_offset),
+          m_file_name(file_name),
+          m_file_desc(file_desc)
     {
-        // build the full output filepath with index on the end
-        // open the output fd
-        std::string opath(output_path);
-        opath += ".";
-        opath += std::to_string(m_index);
-        m_output_fd = ::open(opath.data(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (m_output_fd < 0)
-        {
-            ERROR << "Failed to open output file, " << opath << ", " << ::strerror(errno) << endl;
-            s_completed_requests++;
-        }
+        m_start_ns = get_nanoseconds();
     }
 
     bool start_io_uring()
@@ -179,7 +102,7 @@ public:
         return m_file_uring && m_file_uring->prep_read(m_input_fd, m_buffer, BUFFER_SZ, m_offset, this);
     }
 
-    uint32_t process(int res)
+    uint32_t process_io_uring(int res)
     {
         if (!m_file_uring)
             return 0;
@@ -189,34 +112,89 @@ public:
             switch (m_state) {
             case READING_CLIENT_INPUT:
                 // Read successful. Write to stdout.
-                DEBUG(1) << "writing " << res << " bytes to m_output_fd: " << m_output_fd << ENDL;
-                m_file_uring->prep_write(m_output_fd, m_buffer, res, -1, this);
+                DEBUG(2) << "writing " << res << " bytes to m_output_fd: " << m_output_fd << ENDL;
+
+                m_meta.file_hash = compute_hash(std::string_view(m_buffer, res), m_meta.file_hash);
+
+                // could be writing to a spool or similar so have to pass the exact offset to write at instead of just -1 for the end
+                m_file_uring->prep_write(m_output_fd,
+                                         m_buffer,
+                                         res,
+                                         file_start() + m_offset,
+                                         this);
                 m_state = WRITING_TO_FILE;
                 m_offset += res;
                 break;
             case WRITING_TO_FILE:
                 m_bytes_written += res;
-                DEBUG(1) << "reading up to " << BUFFER_SZ << " bytes from m_input_fd: " << m_input_fd << ENDL;
+                DEBUG(2) << "reading up to " << BUFFER_SZ << " bytes from m_input_fd: " << m_input_fd << ENDL;
                 m_file_uring->prep_read(m_input_fd, m_buffer, BUFFER_SZ, m_offset, this);
                 m_state = READING_CLIENT_INPUT;
                 break;
+            case WRITING_META:
+                m_meta_bytes_to_write -= res;
+                if (0 == m_meta_bytes_to_write)
+                {
+                    m_state = COMPLETED;
+                    m_end_ns = get_nanoseconds();
+                    s_times.add_delta(m_end_ns - m_start_ns);
+                }
+                return 0; // no new events so ret 0
             };
             return 1;
         }
         else if (res == 0)
         {
-            // reached EOF
-            DEBUG(1) << "EOF for m_input_fd: " << m_input_fd << ", bytes written: " << m_bytes_written << ENDL;
-            m_state = COMPLETED;
-            s_completed_requests++;
+            switch (m_state) {
+            case READING_CLIENT_INPUT:
+            {
+                // reached EOF
+                DEBUG(2) << "EOF for m_input_fd: " << m_input_fd << ", bytes written: " << m_bytes_written << ", starting meta data, hash: " << m_meta.file_hash << ENDL;
+                // no more data to read, start writing the meta data
+                // should we combine meta parts into single buffer and write once or issue N prep_writes??
+                m_meta.file_size = m_bytes_written;
+                m_meta.file_name_len = m_file_name.size();
+                m_meta.file_desc_len = m_file_desc.size();
+
+                size_t off_set = m_output_offset;
+
+                
+                // write file meta struct
+                m_file_uring->prep_write(m_output_fd, (char*)&m_meta, sizeof(m_meta), off_set, this);
+                off_set += sizeof(m_meta);
+                m_meta_bytes_to_write += sizeof(m_meta);
+
+                // write file name
+                m_file_uring->prep_write(m_output_fd, m_file_name.data(), m_file_name.size(), off_set, this);
+                off_set += m_file_name.size();
+                m_meta_bytes_to_write += m_file_name.size();
+
+                // write file desc
+                m_file_uring->prep_write(m_output_fd, m_file_desc.data(), m_file_desc.size(), off_set, this);
+                m_meta_bytes_to_write += m_file_desc.size();
+
+                m_state = WRITING_META;
+
+                return 1;
+            }
+            case WRITING_TO_FILE:
+                ERROR << "Failed writing to file: res == 0" << ENDL;
+                m_state = FAILED;
+                break;
+
+            case WRITING_META:
+                ERROR << "Failed writing meta data: res == 0" << ENDL;
+                m_state = FAILED;
+                break;
+            };
+
             return 0;
         }
         else if (res < 0)
         {
             // Error reading file
-            ERROR << ::strerror(abs(res)) << endl;
+            ERROR << ::strerror(abs(res)) << ENDL;
             m_state = FAILED;
-            s_completed_requests++;
             return 0;
         }
         return 0;
@@ -225,13 +203,69 @@ public:
     char* buffer() { return m_buffer; }
 };
 
+void uring_thread(uint32_t cnt,
+                  const char* file_name,
+                  const char* file_desc,
+                  uint64_t file_size,
+                  int input_fd,
+                  int spool_fd,
+                  uint64_t block_offset)
+{
+    uint64_t start = get_nanoseconds();
+
+    io_uring_wrapper<client_request> file_uring(cnt * 10);
+    if (!file_uring.is_valid())
+    {
+        return;
+    }
+
+    if (0 > spool_fd)
+    {
+        ERROR << "spool_fd is invalid: " << spool_fd << ENDL;
+        return;
+    }
+
+    off_t output_offset = block_offset;
+
+    vector<client_request*> requests;
+
+    for (uint32_t i = 0; i < cnt; i++)
+    {
+        requests.push_back(new client_request(file_name, file_desc, input_fd, i, &file_uring, spool_fd, output_offset));
+        requests.back()->start_io_uring();
+        if (spool_fd != -1)
+        {
+            output_offset += file_size;
+        }
+    }
+
+    file_uring.submit();
+
+    __kernel_timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 500;   // .5 microseconds
+
+
+    while (file_uring.pending())
+    {
+        // last two nullptr's are timespec and sigmask
+        file_uring.process_events(std::max(cnt / 10, 10u), &ts);
+    }
+}
+
 int32_t main (int argc, char **argv)
 {
     // process cmd line args
     std::string input;
     std::string output;
+    std::string file_name;
+    std::string file_desc("Some file uploaded from some person. Has binary content that could be viewed on a media player and or file editor"sv);
     uint32_t cnt = 1;
     uint32_t event_cnt = 1000;
+    uint32_t thread_cnt = 1;
+    bool spool_it = false;
+    int spool_fd = -1;
+    uint64_t file_size = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -244,9 +278,21 @@ int32_t main (int argc, char **argv)
         {
             output = val;
         }
+        else if (key == "--file-name"sv)
+        {
+            file_name = val;
+        }
+        else if (key == "--file-desc"sv)
+        {
+            file_desc = val;
+        }
         else if (key == "--cnt"sv)
         {
             cnt = aton(val);
+        } 
+        else if (key == "--thread-cnt"sv)
+        {
+            thread_cnt = aton(val);
         } 
         else if (key == "--event-cnt"sv)
         {
@@ -256,39 +302,71 @@ int32_t main (int argc, char **argv)
         {
             s_debug_level = aton(val);
         } 
+        else if (key == "--spool"sv)
+        {
+            spool_it = true;
+        }
+    }
+
+    if (file_name.empty())
+    {
+        file_name = input;
     }
 
     int input_fd = ::open(input.data(), O_RDONLY);
     if (input_fd < 0)
     {
-        ERROR << "Failed to open " << input << ", " << ::strerror(errno) << endl;
+        ERROR << "Failed to open " << input << ", " << ::strerror(errno) << ENDL;
         return 0;
     }
 
-    io_uring_wrapper<client_request> file_uring(cnt);
-    if (!file_uring.is_valid())
+    struct stat sb;
+    if (::fstat(input_fd, &sb) == -1)
     {
-        return 1;
+        ERROR << "failed to stat input file: " << ::strerror(errno) << ENDL;
+        return 0;
+    }
+    file_size = sb.st_size;
+
+    if (spool_it)
+    {
+        spool_fd = ::open(output.data(), O_WRONLY | O_CREAT, 0666);
+        if (-1 == spool_fd)
+        {
+            ERROR << "Failed to open spool file: " << output << ", " << ::strerror(errno) << ENDL;
+            return 0;
+        }
     }
 
-    off_t offset = 0;
+    TRACE << "starting " << cnt << " copies of file: " << file_name << ", bytes: " << file_size << ", threads: " << thread_cnt << ENDL;
 
-    vector<client_request*> requests;
+    uint64_t start = get_nanoseconds();
 
-    for (uint32_t i = 0; i < cnt; i++)
+    off_t output_offset = 0;
+
+    std::vector<std::thread*> threads;
+    uint32_t cnt_per_thread = cnt / thread_cnt;
+    uint32_t block_size = cnt_per_thread * (file_size + file_name.length() + file_desc.length() + sizeof(file_meta_data));
+
+    for (uint32_t t = 0; t < thread_cnt; t++)
     {
-        requests.push_back(new client_request(input_fd, output, i, &file_uring));
-        requests.back()->start_io_uring();
+        threads.push_back(new std::thread(uring_thread,
+                                          cnt_per_thread,
+                                          file_name.data(), 
+                                          file_desc.data(),
+                                          file_size, 
+                                          input_fd,
+                                          spool_fd,
+                                          output_offset));
+
+        output_offset += block_size;
     }
-    file_uring.submit();
 
-    uint32_t batch_cnt = 0;
-
-    while (file_uring.pending())
+    for (auto thrd : threads)
     {
-        // last two nullptr's are timespec and sigmask
-        file_uring.process_events(event_cnt);
-        batch_cnt++;
+        if (thrd->joinable())
+            thrd->join();
     }
-    TRACE << "batch cnt: " << batch_cnt << std::endl;
+
+    s_times.trace_total_ns(file_size, "ns"sv);
 }

@@ -6,16 +6,21 @@
 #include <iostream>
 #include <string_view>
 
-std::pair<std::string_view, std::string_view> split(const std::string_view &src, char delim)
+#include "log.h"
+
+inline std::string_view remove_before(std::string_view &src, std::string_view delim)
 {
-    size_t eq = src.find('=');
+    size_t eq = src.find(delim);
     std::string_view left = src.substr(0, eq);
-    std::string_view right;
     if (eq != std::string_view::npos)
     {
-        right = src.substr(eq + 1);
+        src.remove_prefix(eq + delim.size());
     }
-    return std::pair(left, right);
+    else
+    {
+        src.remove_prefix(src.size());
+    }
+    return left;
 }
 
 template<typename NUMBER> 
@@ -27,17 +32,17 @@ bool aton(auto str, NUMBER &number, bool short_ok = false)
     auto const out = std::from_chars(begin, end, value, 10);
     if (out.ec != std::errc{} || (!short_ok && out.ptr != end))
     {
-        std::cerr << str << '\n'
-                  << std::string(std::distance(begin, out.ptr), ' ') << "^- here" << std::endl;
+        ERROR << str << '\n'
+              << std::string(std::distance(begin, out.ptr), ' ') << "^- here" << ENDL;
         auto const ec = std::make_error_code(out.ec);
-        std::cerr << "err: " << ec.message() << std::endl;
+        ERROR << "err: " << ec.message() << ENDL;
         return false;
     }
     number = value;
     return true;
 }
 
-uint32_t aton(auto str, bool short_ok = false)
+inline uint32_t aton(auto str, bool short_ok = false)
 {
     uint32_t value = 0;
     const char* begin = str.data();
@@ -45,10 +50,10 @@ uint32_t aton(auto str, bool short_ok = false)
     auto const out = std::from_chars(begin, end, value, 10);
     if (out.ec != std::errc{} || (!short_ok && out.ptr != end))
     {
-        std::cerr << str << '\n'
-                  << std::string(std::distance(begin, out.ptr), ' ') << "^- here" << std::endl;
+        ERROR << str << '\n'
+              << std::string(std::distance(begin, out.ptr), ' ') << "^- here" << ENDL;
         auto const ec = std::make_error_code(out.ec);
-        std::cerr << "err: " << ec.message() << std::endl;
+        ERROR << "err: " << ec.message() << ENDL;
         return 0;
     }
     return value;

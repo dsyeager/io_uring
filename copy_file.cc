@@ -355,24 +355,32 @@ private:
     STATE m_state = READING_CLIENT_INPUT;
     char m_buffer[BUFFER_SZ];
     off_t m_offset = 0;
+    off_t m_output_offset = 0;
     int  m_input_fd = -1;
     int  m_output_fd = -1;
     uint32_t m_index = 0;
     io_uring_wrapper<client_request> *m_io_uring = nullptr;
 
 public:
-    client_request(int input_fd, std::string_view output_path, uint32_t index, io_uring_wrapper<client_request> *iou)
-    : m_input_fd(dup(input_fd)), m_index(index), m_io_uring(iou)
+    client_request(int input_fd,
+                   std::string_view output_path,
+                   uint32_t index,
+                   io_uring_wrapper<client_request> *iou,
+                   int output_fd = -1, uint64_t output_offset = 0)
+    : m_input_fd(dup(input_fd)), m_index(index), m_io_uring(iou), m_output_fd(output_fd), m_output_offset(output_offset)
     {
-        // build the full output filepath with index on the end
-        // open the output fd
-        std::string opath(output_path);
-        opath += ".";
-        opath += std::to_string(m_index);
-        m_output_fd = ::open(opath.data(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (m_output_fd < 0)
+        if (m_output_fd == -1)
         {
-            cerr << "Failed to open output file, " << opath << ", " << strerror(errno) << endl;
+            // build the full output filepath with index on the end
+            // open the output fd
+            std::string opath(output_path);
+            opath += ".";
+            opath += std::to_string(m_index);
+            m_output_fd = ::open(opath.data(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (m_output_fd < 0)
+            {
+                cerr << "Failed to open output file, " << opath << ", " << strerror(errno) << endl;
+            }
         }
     }
 
@@ -389,7 +397,7 @@ public:
             switch (m_state) {
             case READING_CLIENT_INPUT:
                 // Read successful. Write to stdout.
-                m_io_uring->submit_to_sq(m_output_fd, IORING_OP_WRITE, m_offset, m_buffer, res, this);
+                m_io_uring->submit_to_sq(m_output_fd, IORING_OP_WRITE, m_output_offset + m_offset, m_buffer, res, this);
                 m_state = WRITING_TO_FILE;
                 m_offset += res;
                 break;
@@ -423,6 +431,7 @@ int32_t main (int argc, char **argv)
     std::string input;
     std::string output;
     uint32_t cnt = 1;
+    bool spool_it = false;
 
     for (int i = 1; i < argc; i++)
     {
@@ -440,6 +449,10 @@ int32_t main (int argc, char **argv)
         {
             cnt = aton(val);
         } 
+        else if (key == "--spool"sv)
+        {
+            spool_it = true;
+        }
     }
 
     int input_fd = ::open(input.data(), O_RDONLY);
