@@ -136,6 +136,7 @@ uint32_t log_file::process_io_uring(int res)
         {
             std::cerr << "Failed to write log buffer: " << ::strerror(-res) << std::endl;
         }
+
         if (res < m_output_buffer->size())
         {
             std::cerr << "PARTIAL WRITE, wrote " << res << " bytes out of " << m_output_buffer->size() << std::endl;
@@ -154,10 +155,8 @@ void log_file::process_events()
 {
     if (m_state == IDLE)
         return;
-    __kernel_timespec ts;
-    ts.tv_sec = 0;
-    ts.tv_nsec = 1000;
-    m_io_uring->process_events(1, &ts);
+
+    m_io_uring->process_events();
 }
 
 void log_file::write_buffer(bool lock_it)

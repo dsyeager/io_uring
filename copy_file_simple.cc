@@ -204,6 +204,7 @@ public:
 };
 
 void uring_thread(uint32_t cnt,
+                  uint32_t each,
                   const char* file_name,
                   const char* file_desc,
                   uint64_t file_size,
@@ -212,6 +213,11 @@ void uring_thread(uint32_t cnt,
                   uint64_t block_offset)
 {
     uint64_t start = get_nanoseconds();
+
+    // 100 total file copies takes around .14 seconds
+    // 200 increases it to .34 seconds, more than double
+    // 300 takes it to .57 seconds
+    // 400 takes around .75 seconds, seems like congestion slows things down
 
     io_uring_wrapper<client_request> file_uring(cnt * 10);
     if (!file_uring.is_valid())
@@ -229,27 +235,24 @@ void uring_thread(uint32_t cnt,
 
     vector<client_request*> requests;
 
-    for (uint32_t i = 0; i < cnt; i++)
+    while (requests.size() != cnt)
     {
-        requests.push_back(new client_request(file_name, file_desc, input_fd, i, &file_uring, spool_fd, output_offset));
-        requests.back()->start_io_uring();
-        if (spool_fd != -1)
+        for (uint32_t i = 0; i < each && requests.size() < cnt; i++)
         {
-            output_offset += file_size;
+            requests.push_back(new client_request(file_name, file_desc, input_fd, requests.size(), &file_uring, spool_fd, output_offset));
+            requests.back()->start_io_uring();
+            if (spool_fd != -1)
+            {
+                output_offset += file_size;
+            }
         }
-    }
 
-    file_uring.submit();
+        file_uring.submit();
 
-    __kernel_timespec ts;
-    ts.tv_sec = 0;
-    ts.tv_nsec = 500;   // .5 microseconds
-
-
-    while (file_uring.pending())
-    {
-        // last two nullptr's are timespec and sigmask
-        file_uring.process_events(std::max(cnt / 10, 10u), &ts);
+        while (file_uring.pending())
+        {
+            file_uring.process_events();
+        }
     }
 }
 
@@ -261,9 +264,10 @@ int32_t main (int argc, char **argv)
     std::string file_name;
     std::string file_desc("Some file uploaded from some person. Has binary content that could be viewed on a media player and or file editor"sv);
     uint32_t cnt = 1;
+    uint32_t each = 25;
     uint32_t event_cnt = 1000;
     uint32_t thread_cnt = 1;
-    bool spool_it = false;
+    bool spool_it = true;
     int spool_fd = -1;
     uint64_t file_size = 0;
 
@@ -304,7 +308,11 @@ int32_t main (int argc, char **argv)
         } 
         else if (key == "--spool"sv)
         {
-            spool_it = true;
+            spool_it = (val == "true"sv);
+        }
+        else if (key == "--each"sv)
+        {
+            each = aton(val);
         }
     }
 
@@ -352,6 +360,7 @@ int32_t main (int argc, char **argv)
     {
         threads.push_back(new std::thread(uring_thread,
                                           cnt_per_thread,
+                                          each,
                                           file_name.data(), 
                                           file_desc.data(),
                                           file_size, 

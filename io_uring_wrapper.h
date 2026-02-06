@@ -86,6 +86,16 @@ public:
     io_uring_wrapper(uint32_t queue_depth)
         : m_queue_depth(queue_depth)
     {
+        struct io_uring_params params;
+
+        memset(&params, 0, sizeof(params));
+        params.flags |= IORING_SETUP_SQPOLL;
+        params.sq_thread_idle = 5000; // Set idle timeout to 5 seconds, not handling the timeout for now
+
+        //int ret = io_uring_queue_init_params(queue_depth, &m_ring, &params);
+        // enabling SQPOLL increased both CPU and test run times by 30%
+        // maybe there were additional settings needed?
+
         int ret = io_uring_queue_init(queue_depth, &m_ring, 0);
         if (ret < 0)
         {
@@ -239,7 +249,7 @@ public:
         return true;
     }
 
-    uint32_t process_events(uint32_t max_events = UINT32_MAX, __kernel_timespec *ts = nullptr)
+    uint32_t process_events()
     {
         if (!m_valid)
         {
