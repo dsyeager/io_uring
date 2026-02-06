@@ -1,0 +1,9 @@
+General notes as a work through this
+
+The copy_file_simple app showed performance degradation for total throughput as the number of simultaneous writes increased above 40. So added a command line option for adjusting the simultaneous writes. The difference between 40 writes and 400 writes was around 2x. The optimal number will be hardware specific. Well worth considering how to throttle simultaneous writes in prod.
+
+
+SQPOLL. Docs suggested that enabling a polling thread in the kernel would speed stuff up. I tried it the simple way in copy_file_simple. CPU increase a lot and performance decreased. It is worth revisiting at some point.
+
+
+The kernel reference counts file descriptors. io_uring allows you to allocate/register an array of file descriptors that lets you avoid the reference counting in the kernel. Supposedly a 5%+ gain, especially in multithreaded applications. I didn't do it in copy_file_simple since it doesn't have lots of FD's but I plan on trying it in the client/server apps. I think the server app could benefit from it.
