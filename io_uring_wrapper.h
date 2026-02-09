@@ -40,7 +40,9 @@ Questions:
 #include <unistd.h>
 
 #include <iostream>
+#include <queue>
 #include <tuple>
+#include <vector>
 
 #include "log.h"
 #include "misc.h"
@@ -79,12 +81,37 @@ to open a file asynch:
         The kernel will then execute the open operation asynchronously.
 */
 
+
+enum IO_TYPE {IO_READ, IO_WRITE};
+
+struct io_uring_request
+{
+public:
+    IO_TYPE io_type = IO_READ;
+    int fd = -1;
+    const char *buffer = nullptr;
+    size_t len = 0;
+    off_t offset = 0;
+    void *data = nullptr;
+    void set(IO_TYPE in_io_type, int in_fd, const char *in_buffer, size_t in_len, off_t in_offset, void *in_data)
+    {
+        io_type = in_io_type;
+        fd = in_fd;
+        buffer = in_buffer;
+        len = in_len;
+        offset = in_offset;
+        data = in_data;
+    }
+};
+
+
+
 template<class EVENT_CLASS>
 class io_uring_wrapper
 {
 public:
-    io_uring_wrapper(uint32_t queue_depth)
-        : m_queue_depth(queue_depth)
+    io_uring_wrapper(uint32_t queue_depth, size_t max_active = 10)
+        : m_queue_depth(queue_depth), m_max_active(max_active)
     {
         struct io_uring_params params;
 
@@ -147,6 +174,13 @@ public:
         if (!m_valid)
             return false;
 
+        if (m_current_active >= m_max_active)
+        {
+            DEBUG(2) << "queueing write request" << ENDL;
+            queue_request(IO_WRITE, fd, buffer, len, offset, data);
+            return true;
+        }
+
         io_uring_sqe *sqe = get_sqe();
 
         if (!sqe)
@@ -160,15 +194,25 @@ public:
         io_uring_prep_write(sqe, fd, buffer, len, offset);
 
         if (!m_multishot)
+        {
             m_pending++;
+            m_current_active++;
+        }
 
         return true;
     }
 
-    bool prep_read(int fd, char *buffer, size_t sz, off_t offset, void *data)
+    bool prep_read(int fd, char *buffer, size_t len, off_t offset, void *data)
     {
         if (!m_valid)
             return false;
+
+        if (m_current_active >= m_max_active)
+        {
+            DEBUG(2) << "queueing read request" << ENDL;
+            queue_request(IO_READ, fd, buffer, len, offset, data);
+            return true;
+        }
 
         io_uring_sqe *sqe = get_sqe();
 
@@ -180,10 +224,13 @@ public:
 
         io_uring_sqe_set_data(sqe, data);
 
-        io_uring_prep_read(sqe, fd, buffer, sz, offset);
+        io_uring_prep_read(sqe, fd, buffer, len, offset);
 
         if (!m_multishot)
+        {
             m_pending++;
+            m_current_active++;
+        }
 
         return true;
     }
@@ -271,7 +318,12 @@ public:
         io_uring_for_each_cqe(&m_ring, head, cqe)
         {
              if (!m_multishot)
-                 m_pending--; // decrement prior to ::process potentially incrementing
+             {
+                 if (m_pending)
+                     m_pending--; // decrement prior to ::process potentially incrementing
+                 if (m_current_active)
+                     m_current_active--;
+             }
              EVENT_CLASS *req = reinterpret_cast<EVENT_CLASS*>(io_uring_cqe_get_data(cqe));
              uint32_t events = req->process_io_uring(cqe->res);
              DEBUG(3) << "called process_io_uring, events: " << events << ENDL;
@@ -279,7 +331,34 @@ public:
              i++;
         }
 
-        DEBUG(2) << "batch events: " << i << ", new events: " << new_events << ENDL;
+        DEBUG(2) << "batch events: " << i 
+                 << ", new events: " << new_events 
+                 << ", waiting reqs: " << m_waiting_requests.size()
+                 << ", current active reqs: " << m_current_active 
+                 << ", max active reqs: " << m_max_active 
+                 << ", pending reqs: " << m_pending << ENDL;
+
+        while (m_waiting_requests.size() && m_current_active < m_max_active)
+        {
+            io_uring_request *req = m_waiting_requests.front();
+            m_waiting_requests.pop();
+            switch (req->io_type) {
+            case IO_READ:
+                if (!prep_read(req->fd, const_cast<char*>(req->buffer), req->len, req->offset, req->data))
+                {
+                    ERROR << "prep_read failed" << ENDL;
+                }
+                break;
+            case IO_WRITE:
+                if (!prep_write(req->fd, req->buffer, req->len, req->offset, req->data))
+                {
+                    ERROR << "prep_write failed" << ENDL;
+                }
+                break;
+            }
+            new_events++;
+            m_free_requests.push_back(req);
+        }
 
         if (new_events)
             this->submit();
@@ -293,6 +372,11 @@ public:
     bool is_valid() const { return m_valid; }
 
     uint32_t pending() const { return m_pending; }
+
+    void trace() const
+    {
+        TRACE << "reqs that queued: " << m_reqs_that_queued << ENDL;
+    }
 
 private:
     io_uring m_ring;
@@ -312,7 +396,30 @@ private:
     // tracking the number of arrays and the length of each buffer
     // allow user to call ->add_ring_buffer(number_of_buffers, size_of_buffers)
 
+    std::vector<io_uring_request*> m_free_requests;
+    std::queue<io_uring_request*> m_waiting_requests;
+    size_t m_max_active = 10;
+    size_t m_current_active = 0;
+    size_t m_reqs_that_queued = 0;
+
 private:
+    void queue_request(IO_TYPE io_type, int fd, const char *buffer, size_t len, off_t offset, void *data)
+    {
+        io_uring_request *req = nullptr;
+        if (m_free_requests.size())
+        {
+            req = m_free_requests.back();
+            m_free_requests.pop_back();
+        }
+        else
+        {
+            req = new io_uring_request;
+        }
+        req->set(io_type, fd, buffer, len, offset, data);
+        m_waiting_requests.push(req);
+        m_reqs_that_queued++;
+    }
+
     io_uring_sqe* get_sqe()
     {
         if (!m_valid)

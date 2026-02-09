@@ -219,7 +219,8 @@ void uring_thread(uint32_t cnt,
     // 300 takes it to .57 seconds
     // 400 takes around .75 seconds, seems like congestion slows things down
 
-    io_uring_wrapper<client_request> file_uring(cnt * 10);
+    io_uring_wrapper<client_request> file_uring(cnt * 10, each);
+
     if (!file_uring.is_valid())
     {
         return;
@@ -235,25 +236,24 @@ void uring_thread(uint32_t cnt,
 
     vector<client_request*> requests;
 
-    while (requests.size() != cnt)
+    for (uint32_t i = 0; i < cnt; i++)
     {
-        for (uint32_t i = 0; i < each && requests.size() < cnt; i++)
+        requests.push_back(new client_request(file_name, file_desc, input_fd, requests.size(), &file_uring, spool_fd, output_offset));
+        requests.back()->start_io_uring();
+        if (spool_fd != -1)
         {
-            requests.push_back(new client_request(file_name, file_desc, input_fd, requests.size(), &file_uring, spool_fd, output_offset));
-            requests.back()->start_io_uring();
-            if (spool_fd != -1)
-            {
-                output_offset += file_size;
-            }
-        }
-
-        file_uring.submit();
-
-        while (file_uring.pending())
-        {
-            file_uring.process_events();
+            output_offset += file_size;
         }
     }
+
+    file_uring.submit();
+
+    while (file_uring.pending())
+    {
+        file_uring.process_events();
+    }
+
+    file_uring.trace();
 }
 
 int32_t main (int argc, char **argv)
