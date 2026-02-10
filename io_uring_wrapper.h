@@ -375,7 +375,7 @@ public:
 
     void trace() const
     {
-        TRACE << "reqs that queued: " << m_reqs_that_queued << ENDL;
+        DEBUG(1) << "reqs that queued: " << m_reqs_that_queued << ENDL;
     }
 
 private:

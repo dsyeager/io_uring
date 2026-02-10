@@ -4,6 +4,7 @@
 #include "io_uring_wrapper.h"
 #include "log.h"
 #include "misc.h"
+#include "proc_pid_stat.h"
 #include "scoped_lock.h"
 #include "string_view.h"
 #include "time_tracker.h"
@@ -270,6 +271,7 @@ int32_t main (int argc, char **argv)
     bool spool_it = true;
     int spool_fd = -1;
     uint64_t file_size = 0;
+    bool show_percentiles = false;
 
     for (int i = 1; i < argc; i++)
     {
@@ -314,7 +316,13 @@ int32_t main (int argc, char **argv)
         {
             each = aton(val);
         }
+        else if (key == "--percentiles"sv || key == "--%"sv)
+        {
+            show_percentiles = true;
+        }
     }
+
+    proc_pid_stat stats;
 
     if (file_name.empty())
     {
@@ -346,7 +354,7 @@ int32_t main (int argc, char **argv)
         }
     }
 
-    TRACE << "starting " << cnt << " copies of file: " << file_name << ", bytes: " << file_size << ", threads: " << thread_cnt << ENDL;
+    //TRACE << "starting " << cnt << " copies of file: " << file_name << ", bytes: " << file_size << ", threads: " << thread_cnt << ENDL;
 
     uint64_t start = get_nanoseconds();
 
@@ -377,5 +385,8 @@ int32_t main (int argc, char **argv)
             thrd->join();
     }
 
-    s_times.trace_total_ns(file_size, "ns"sv);
+    stats.read_stats("total");
+    stats.trace();
+
+    s_times.trace_total_ns(file_size, "ns"sv, thread_cnt, show_percentiles);
 }

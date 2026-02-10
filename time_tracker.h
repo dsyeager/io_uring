@@ -44,7 +44,7 @@ public:
               << ENDL;
     }
 
-    void trace_total_ns(uint64_t bytes, std::string_view unit)
+    void trace_total_ns(uint64_t bytes, std::string_view unit, size_t thread_cnt, bool show_percentiles)
     {
         m_end = get_nanoseconds();
         uint64_t ns = m_end - m_start;
@@ -53,14 +53,18 @@ public:
         uint64_t mb_per_sec = bytes_per_sec / 1024 / 1024;
 
         std::sort(m_times.begin(), m_times.end());
-        TRACE << "Total Requests: " << m_times.size()
-              << ", total bytes: " << commas(bytes_copied)
-              << ", bytes each: " << bytes
-              << ", MB/s: " << commas(mb_per_sec) << ENDL;
+        TRACE << "Total reqs: " << m_times.size()
+              << ", bytes: " << commas(bytes_copied)
+              << ", MB/s: " << commas(mb_per_sec) 
+              << ", threads: " << thread_cnt
+              << ", ms: " << commas(ns / 1000000) << ENDL;
 
-        trace_total_ns_percentile(5, bytes, unit);
-        trace_total_ns_percentile(50, bytes, unit);
-        trace_total_ns_percentile(95, bytes, unit);
+        if (show_percentiles)
+        {
+            trace_total_ns_percentile(5, bytes, unit);
+            trace_total_ns_percentile(50, bytes, unit);
+            trace_total_ns_percentile(95, bytes, unit);
+        }
     }
 
 
