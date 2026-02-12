@@ -3,6 +3,11 @@
 #include <array>
 #include <string_view>
 
+// this was me toying with std::array (local memory) for the headers and body.
+// works fine for the body since we never try to hold the entire file in memory
+// but for headers we want to hold all the headers in memory, or that is the norm for a proxy web server
+//     could potentialy parse the headers as we receive them, negating the need to hold the entire headers in memory.....
+
 template<typename TYPE, size_t MAX_SIZE>
 class local_buffer : public std::array<TYPE, MAX_SIZE>
 {

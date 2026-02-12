@@ -18,3 +18,4 @@ void process_error_log_events();
 #define WARN  { BEGL << " WARN " << __func__ << ' ' << __FILE__ << ':' << __LINE__ << ' '
 #define DEBUG(level) if (s_debug_level >= level)  { BEGL << " DEBUG" << level << ' ' << __func__ << ' ' << __FILE__ << ':' << __LINE__ << ' '
 #define ENDL '\n'; submit_log_entry(s_log_buffer); }
+#define THIS ", " << uint64_t(this)

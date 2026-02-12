@@ -1,0 +1,2 @@
+g++ -Wno-deprecated-declarations -std=c++20 -g -O3 -I../misc/src -I../string_view/src log_file.cc log.cc client.cc -o uring_client -luring -lcrypto 
+g++ -Wno-deprecated-declarations -std=c++20 -g -O3 -I../misc/src -I../string_view/src log_file.cc log.cc server.cc -o uring_server -luring 

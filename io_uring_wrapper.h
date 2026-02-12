@@ -79,6 +79,16 @@ to open a file asynch:
 
     Submit the Request: Tell the kernel that the request is ready for processing using io_uring_submit().
         The kernel will then execute the open operation asynchronously.
+
+Kernel Congestion:
+    At some point/threshold, the number of simultaneous IO events starts to cause traffic congestion in the kernel. I first noticed it
+    on my quad core thinkcentre desktop. Somewhere between 35-40 simultaneous IO requests was the sweet spot. On a single thread that performed OKish
+    but max throughput was achieved using 4 threads with 10 simultaneous requests per thread. Adding an app level IO queue kept the kernel humming and allowed
+    the tests to finish faster.
+
+    Some unknows that would be good to understand are:
+    - Is the congestion per IO type? Will too many socket requests effect file IO requests or vice a versa?
+    - Is that congestion visable via system metrics or does it just manifest as slower throughput?  
 */
 
 
@@ -154,6 +164,7 @@ public:
 
     bool prep_open_at(int dir_fd, const char *path, int flags, mode_t mode, void *data)
     {
+        DEBUG(3) << "data: " << uint64_t(data) << ENDL;
         io_uring_sqe *sqe = get_sqe();
 
         if (!sqe)
@@ -173,10 +184,11 @@ public:
     {
         if (!m_valid)
             return false;
+        DEBUG(3) << "data: " << uint64_t(data) << ENDL;
 
-        if (m_current_active >= m_max_active)
+        if (m_waiting_requests.size() || m_current_active >= m_max_active)
         {
-            DEBUG(2) << "queueing write request" << ENDL;
+            DEBUG(2) << "queueing write request, data: " << uint64_t(data) << ENDL;
             queue_request(IO_WRITE, fd, buffer, len, offset, data);
             return true;
         }
@@ -207,9 +219,10 @@ public:
         if (!m_valid)
             return false;
 
-        if (m_current_active >= m_max_active)
+        DEBUG(3) << "data: " << uint64_t(data) << ENDL;
+        if (m_waiting_requests.size() || m_current_active >= m_max_active)
         {
-            DEBUG(2) << "queueing read request" << ENDL;
+            DEBUG(2) << "queueing read request, data: " << uint64_t(data) << ENDL;
             queue_request(IO_READ, fd, buffer, len, offset, data);
             return true;
         }
@@ -244,6 +257,7 @@ public:
         if (!m_valid)
             return false;
 
+        DEBUG(3) << "data: " << uint64_t(data) << ENDL;
         io_uring_sqe *sqe = get_sqe();
 
         if (!sqe)
@@ -267,6 +281,7 @@ public:
     {
         io_uring_sqe *sqe = get_sqe();
 
+        DEBUG(3) << "data: " << uint64_t(data) << ENDL;
         if (!sqe)
             return false;
 
@@ -283,6 +298,7 @@ public:
     {
         io_uring_sqe *sqe = get_sqe();
 
+        DEBUG(3) << "data: " << uint64_t(data) << ENDL;
         if (!sqe)
             return false;
 
@@ -296,7 +312,7 @@ public:
         return true;
     }
 
-    uint32_t process_events()
+    uint32_t process_events(uint32_t limit = 0)
     {
         if (!m_valid)
         {
@@ -304,7 +320,7 @@ public:
             return 0;
         }
 
-        if (!m_multishot && !m_pending)
+        if (!m_multishot && !m_pending && !m_waiting_requests.size())
         {
             DEBUG(5) << "m_pending: " << m_pending << ENDL;
             return 0;
@@ -329,6 +345,8 @@ public:
              DEBUG(3) << "called process_io_uring, events: " << events << ENDL;
              new_events += events;
              i++;
+             if (limit && i >=limit)
+                 break;
         }
 
         DEBUG(2) << "batch events: " << i 
@@ -338,10 +356,15 @@ public:
                  << ", max active reqs: " << m_max_active 
                  << ", pending reqs: " << m_pending << ENDL;
 
+        if (i > 0)
+            io_uring_cq_advance(&m_ring, i);
+
+
         while (m_waiting_requests.size() && m_current_active < m_max_active)
         {
             io_uring_request *req = m_waiting_requests.front();
             m_waiting_requests.pop();
+            DEBUG(3) << "starting waiting request, data: " << uint64_t(req->data) << ENDL;
             switch (req->io_type) {
             case IO_READ:
                 if (!prep_read(req->fd, const_cast<char*>(req->buffer), req->len, req->offset, req->data))
@@ -362,9 +385,6 @@ public:
 
         if (new_events)
             this->submit();
-
-        if (i > 0)
-            io_uring_cq_advance(&m_ring, i);
 
         return i;
     }
