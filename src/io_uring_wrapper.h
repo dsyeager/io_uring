@@ -1,34 +1,5 @@
 #pragma once
 
-/*
-io_uring(7) — Linux manual page
-#include <linux/io_uring.h>
-
-After you add one or more SQEs, you need to call
-    io_uring_enter(2) (if polling mode is not being used)
-
-io_uring supports a polling mode that lets you
-    avoid the call to io_uring_enter(2), which you use to inform the
-    kernel that you have queued SQEs on to the SQ.  With SQ Polling,
-    io_uring starts a kernel thread that polls the submission queue
-    for any I/O requests you submit by adding SQEs.  With SQ Polling
-    enabled, there is no need for you to call io_uring_enter(2),
-    letting you avoid the overhead of system calls.
-
-IORING_ENTER_SQ_WAKEUP
-    If the ring has been created with IORING_SETUP_SQPOLL, then
-    this flag asks the kernel to wakeup the SQ kernel thread to submit IO.
-
-
-
-Questions:
-- How does does a process using IO uring effect that process's priority in the system? Does the kernel's IO scheduler treat them as individual requests?
-
-*/
-
-// NOTE: this sample code started as the example given in man page for io_uring
-//       made it pretty to my eyes then converted it to C++ with some guess work
-
 #include <errno.h>
 #include <fcntl.h>
 #include <liburing.h>
@@ -46,12 +17,6 @@ Questions:
 
 #include "log.h"
 #include "misc.h"
-
-template<typename SRC_TYPE, typename OFF_TYPE, typename DEST_TYPE>
-void from_offset(SRC_TYPE base, OFF_TYPE bytes, DEST_TYPE &destination)
-{
-    destination = reinterpret_cast<DEST_TYPE>(static_cast<char*>(base) + bytes);
-}
 
 /*
    Some good reading: https://github.com/axboe/liburing/wiki/io_uring-and-networking-in-2023
@@ -92,33 +57,33 @@ Kernel Congestion:
 */
 
 
-enum IO_TYPE {IO_READ, IO_WRITE};
-
-struct io_uring_request
-{
-public:
-    IO_TYPE io_type = IO_READ;
-    int fd = -1;
-    const char *buffer = nullptr;
-    size_t len = 0;
-    off_t offset = 0;
-    void *data = nullptr;
-    void set(IO_TYPE in_io_type, int in_fd, const char *in_buffer, size_t in_len, off_t in_offset, void *in_data)
-    {
-        io_type = in_io_type;
-        fd = in_fd;
-        buffer = in_buffer;
-        len = in_len;
-        offset = in_offset;
-        data = in_data;
-    }
-};
-
-
 
 template<class EVENT_CLASS>
 class io_uring_wrapper
 {
+private:
+    struct io_uring_request
+    {
+    public:
+        enum IO_TYPE {IO_READ, IO_WRITE};
+    
+        IO_TYPE io_type = IO_READ;
+        int fd = -1;
+        const char *buffer = nullptr;
+        size_t len = 0;
+        off_t offset = 0;
+        void *data = nullptr;
+        void set(IO_TYPE in_io_type, int in_fd, const char *in_buffer, size_t in_len, off_t in_offset, void *in_data)
+        {
+            io_type = in_io_type;
+            fd = in_fd;
+            buffer = in_buffer;
+            len = in_len;
+            offset = in_offset;
+            data = in_data;
+        }
+    };
+
 public:
     io_uring_wrapper(uint32_t queue_depth, size_t max_active = 10)
         : m_queue_depth(queue_depth), m_max_active(max_active)
@@ -154,11 +119,19 @@ public:
     {
         if (!m_valid)
             return -1;
+
+        if (!m_ready_to_submit)
+            return 0;
+
         int ret = io_uring_submit(&m_ring);
+
         if (ret < 0)
         {
             ERROR << "io_uring_submit failed: " << ::strerror(-ret) << ENDL;
         }
+
+        m_ready_to_submit = 0;
+
         return ret;
     }
 
@@ -174,22 +147,24 @@ public:
 
         io_uring_prep_openat(sqe, dir_fd, path, flags, mode);
 
+        m_ready_to_submit++;
+
         if (!m_multishot)
             m_pending++;
 
         return true;
     }
 
-    bool prep_write(int fd, const char *buffer, size_t len, off_t offset, void *data)
+    bool prep_write(int fd, const char *buffer, size_t len, off_t offset, void *data, bool queue = true)
     {
         if (!m_valid)
             return false;
         DEBUG(3) << "data: " << uint64_t(data) << ENDL;
 
-        if (m_waiting_requests.size() || m_current_active >= m_max_active)
+        if (queue && (m_waiting_requests.size() || m_current_active >= m_max_active))
         {
-            DEBUG(2) << "queueing write request, data: " << uint64_t(data) << ENDL;
-            queue_request(IO_WRITE, fd, buffer, len, offset, data);
+            DEBUG(2) << "queueing write request, data: " << uint64_t(data) << ", m_current_active: " << m_current_active << ENDL;
+            queue_request(io_uring_request::IO_WRITE, fd, buffer, len, offset, data);
             return true;
         }
 
@@ -205,6 +180,8 @@ public:
 
         io_uring_prep_write(sqe, fd, buffer, len, offset);
 
+        m_ready_to_submit++;
+
         if (!m_multishot)
         {
             m_pending++;
@@ -214,16 +191,16 @@ public:
         return true;
     }
 
-    bool prep_read(int fd, char *buffer, size_t len, off_t offset, void *data)
+    bool prep_read(int fd, char *buffer, size_t len, off_t offset, void *data, bool queue = true)
     {
         if (!m_valid)
             return false;
 
-        DEBUG(3) << "data: " << uint64_t(data) << ENDL;
-        if (m_waiting_requests.size() || m_current_active >= m_max_active)
+        DEBUG(3) << "data: " << uint64_t(data) << ", offset: " << offset << ENDL;
+        if (queue && (m_waiting_requests.size() || m_current_active >= m_max_active))
         {
             DEBUG(2) << "queueing read request, data: " << uint64_t(data) << ENDL;
-            queue_request(IO_READ, fd, buffer, len, offset, data);
+            queue_request(io_uring_request::IO_READ, fd, buffer, len, offset, data);
             return true;
         }
 
@@ -238,6 +215,8 @@ public:
         io_uring_sqe_set_data(sqe, data);
 
         io_uring_prep_read(sqe, fd, buffer, len, offset);
+
+        m_ready_to_submit++;
 
         if (!m_multishot)
         {
@@ -289,8 +268,11 @@ public:
 
         io_uring_prep_connect(sqe, fd, addr, addrlen); 
 
+        m_ready_to_submit++;
+
         if (!m_multishot)
             m_pending++;
+
         return true;
     }
 
@@ -306,9 +288,50 @@ public:
 
         io_uring_prep_close(sqe, fd);
 
+        m_ready_to_submit++;
+
         if (!m_multishot)
             m_pending++;
 
+        return true;
+    }
+
+    // relook at these cancel methods
+    // I tried both when working on mssh and
+    // it appeared to be closing all pending requests
+    // not just the requests associated with data or fd
+    bool prep_cancel(void *data)
+    {
+        io_uring_sqe *sqe = get_sqe();
+
+        DEBUG(3) << "data: " << uint64_t(data) << ENDL;
+
+        if (!sqe)
+            return false;
+
+        io_uring_sqe_set_data(sqe, data);
+
+        io_uring_prep_cancel64(sqe, uint64_t(data), 0);
+
+        m_ready_to_submit++;
+        
+        return true;
+    }
+
+    bool prep_cancel_fd(int fd, void *data)
+    {
+        io_uring_sqe *sqe = get_sqe();
+
+        DEBUG(3) << "fd: " << fd << ", data: " << uint64_t(data) << ENDL;
+        if (!sqe)
+            return false;
+
+        io_uring_sqe_set_data(sqe, data);
+
+        io_uring_prep_cancel_fd(sqe, fd, IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ALL);
+
+        m_ready_to_submit++;
+        
         return true;
     }
 
@@ -360,20 +383,24 @@ public:
             io_uring_cq_advance(&m_ring, i);
 
 
-        while (m_waiting_requests.size() && m_current_active < m_max_active)
+        size_t threashold = m_max_active;
+        if (new_events == 0)
+            threashold /= 2;
+
+        while (m_waiting_requests.size() && m_current_active < (m_max_active/2))
         {
             io_uring_request *req = m_waiting_requests.front();
             m_waiting_requests.pop();
             DEBUG(3) << "starting waiting request, data: " << uint64_t(req->data) << ENDL;
             switch (req->io_type) {
-            case IO_READ:
-                if (!prep_read(req->fd, const_cast<char*>(req->buffer), req->len, req->offset, req->data))
+            case io_uring_request::IO_READ:
+                if (!prep_read(req->fd, const_cast<char*>(req->buffer), req->len, req->offset, req->data, false))
                 {
                     ERROR << "prep_read failed" << ENDL;
                 }
                 break;
-            case IO_WRITE:
-                if (!prep_write(req->fd, req->buffer, req->len, req->offset, req->data))
+            case io_uring_request::IO_WRITE:
+                if (!prep_write(req->fd, req->buffer, req->len, req->offset, req->data, false))
                 {
                     ERROR << "prep_write failed" << ENDL;
                 }
@@ -383,6 +410,7 @@ public:
             m_free_requests.push_back(req);
         }
 
+        //TRACE << "new_events: " << new_events << ", i: " << i << ENDL;
         if (new_events)
             this->submit();
 
@@ -402,6 +430,7 @@ private:
     io_uring m_ring;
     uint32_t m_queue_depth = 10;
     uint32_t m_pending = 0;
+    uint32_t m_ready_to_submit = 0;
     bool m_valid = true;
     bool m_multishot = false;
 
@@ -423,7 +452,7 @@ private:
     size_t m_reqs_that_queued = 0;
 
 private:
-    void queue_request(IO_TYPE io_type, int fd, const char *buffer, size_t len, off_t offset, void *data)
+    void queue_request(io_uring_request::IO_TYPE io_type, int fd, const char *buffer, size_t len, off_t offset, void *data)
     {
         io_uring_request *req = nullptr;
         if (m_free_requests.size())

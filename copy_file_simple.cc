@@ -29,8 +29,7 @@
 using std::string, std::string_view, std::vector;
 using namespace std::literals;
 
-#define BUFFER_SZ 64 * 1024
-
+#define BUFFER_SZ 128 * 1024
 
 time_tracker s_times(10000);
 
@@ -310,7 +309,7 @@ int32_t main (int argc, char **argv)
         } 
         else if (key == "--spool"sv)
         {
-            spool_it = (val == "true"sv);
+            spool_it = (val.empty() || val == "true"sv);
         }
         else if (key == "--each"sv)
         {
@@ -354,7 +353,7 @@ int32_t main (int argc, char **argv)
         }
     }
 
-    //TRACE << "starting " << cnt << " copies of file: " << file_name << ", bytes: " << file_size << ", threads: " << thread_cnt << ENDL;
+    TRACE << "starting " << cnt << " copies of file: " << file_name << ", bytes: " << file_size << ", threads: " << thread_cnt << ENDL;
 
     uint64_t start = get_nanoseconds();
 
@@ -366,6 +365,7 @@ int32_t main (int argc, char **argv)
 
     for (uint32_t t = 0; t < thread_cnt; t++)
     {
+        DEBUG(1) << "thread: " << t << ", per thread: " << cnt_per_thread << ", each: " << each << ENDL;
         threads.push_back(new std::thread(uring_thread,
                                           cnt_per_thread,
                                           each,
